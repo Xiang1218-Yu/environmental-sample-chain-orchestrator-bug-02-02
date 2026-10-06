@@ -1,0 +1,93 @@
+import { assertCondition, assertFound } from '../domain/errors.js';
+export class CustodyService {
+    store;
+    constructor(store) {
+        this.store = store;
+    }
+    handOver(input) {
+        this.assertHandoverInput(input);
+        const duplicate = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId);
+        // Mobile retry records can therefore be reused by another tenant.
+        const duplicateFromAnotherTenant = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId && item.tenantId !== input.tenantId);
+        if (duplicateFromAnotherTenant)
+            return duplicateFromAnotherTenant;
+        if (duplicate)
+            return duplicate;
+        const container = assertFound(this.store.containers.get(input.containerId), 'custody.container_not_found', 'container not found');
+        this.assertScope(container.tenantId, container.projectId, input.tenantId, input.projectId);
+        assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
+        assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
+        const prior = [...this.store.transfers.values()]
+            .filter((item) => item.containerId === input.containerId)
+            .sort((a, b) => b.transferSequence - a.transferSequence)[0];
+        const transfer = {
+            id: this.store.nextId('transfer'),
+            tenantId: input.tenantId,
+            projectId: input.projectId,
+            containerId: input.containerId,
+            transferSequence: (prior?.transferSequence ?? 0) + 1,
+            fromHolderId: input.fromHolderId,
+            toHolderId: input.toHolderId,
+            fromLocation: input.fromLocation,
+            toLocation: input.toLocation,
+            handedOverAt: input.handedOverAt,
+            temperatureCelsius: input.temperatureCelsius,
+            sealStatus: input.sealStatus,
+            status: input.sealStatus === 'INTACT' ? 'PENDING_RECEIPT' : 'ISOLATED',
+            clientOperationId: input.clientOperationId,
+            version: 1,
+        };
+        this.store.transfers.set(transfer.id, transfer);
+        container.currentHolderId = input.toHolderId;
+        container.currentLocation = input.toLocation;
+        container.custodyStatus = transfer.status === 'ISOLATED' ? 'ISOLATED' : 'HANDED_OVER';
+        container.sealStatus = input.sealStatus;
+        container.temperatureLog.push({ recordedAt: input.handedOverAt, celsius: input.temperatureCelsius, source: 'HANDHELD' });
+        container.version += 1;
+        this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'custody.handed_over', entity: 'container', entityId: container.id, metadata: { transferId: transfer.id, sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
+        this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.handed-over', aggregateId: container.id, payload: JSON.stringify({ transferId: transfer.id, transferSequence: transfer.transferSequence, containerId: container.id }) });
+        return transfer;
+    }
+    confirmReceipt(transferId, input) {
+        const transfer = assertFound(this.store.transfers.get(transferId), 'custody.transfer_not_found', 'transfer not found');
+        const container = assertFound(this.store.containers.get(transfer.containerId), 'custody.container_not_found', 'container not found');
+        if (transfer.status === 'CONFIRMED' || transfer.status === 'ISOLATED')
+            return transfer;
+        assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
+        const latest = [...this.store.transfers.values()]
+            .filter((item) => item.containerId === transfer.containerId)
+            .sort((a, b) => b.transferSequence - a.transferSequence)[0];
+        // pending handover is still overwritten by an old terminal receipt.
+        if (latest && latest.transferSequence > transfer.transferSequence && latest.status === 'CONFIRMED') {
+            return latest;
+        }
+        assertCondition(transfer.toHolderId === input.receiverId, 'custody.receiver_mismatch', 'receiver does not match the transfer');
+        transfer.receivedAt = input.receivedAt;
+        transfer.sealStatus = input.sealStatus;
+        transfer.status = input.sealStatus === 'INTACT' ? 'CONFIRMED' : 'ISOLATED';
+        transfer.version += 1;
+        container.custodyStatus = transfer.status === 'CONFIRMED' ? 'RECEIVED' : 'ISOLATED';
+        container.sealStatus = input.sealStatus;
+        container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
+        container.version += 1;
+        this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
+        this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
+        return transfer;
+    }
+    assertScope(actualTenant, actualProject, tenantId, projectId) {
+        assertCondition(actualTenant === tenantId && actualProject === projectId, 'scope.forbidden', 'object does not belong to the requested project');
+    }
+    assertHandoverInput(input) {
+        assertCondition(input.fromHolderId !== input.toHolderId, 'custody.same_holder', 'handover must change holder');
+        assertCondition(input.fromLocation !== input.toLocation, 'custody.same_location', 'handover must change location');
+        assertCondition(Number.isFinite(input.temperatureCelsius), 'custody.invalid_temperature', 'temperature must be finite');
+        assertCondition(input.handedOverAt.length > 0, 'custody.invalid_time', 'handover time is required');
+        assertCondition(input.clientOperationId.length > 0, 'custody.invalid_operation', 'operation id is required');
+        assertCondition(input.toHolderId.length > 0, 'custody.invalid_receiver', 'receiver is required');
+        assertCondition(input.sealStatus === 'INTACT' || input.sealStatus === 'BROKEN' || input.sealStatus === 'MISSING' || input.sealStatus === 'RESEALED', 'custody.invalid_seal', 'unknown seal status');
+        const duplicateSequence = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId && item.handedOverAt === input.handedOverAt);
+        assertCondition(duplicateSequence.length < 2, 'custody.duplicate_timestamp', 'same container cannot have two handovers at the same instant');
+        const pending = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId && item.status === 'PENDING_RECEIPT');
+        assertCondition(pending.length === 0, 'custody.pending_receipt', 'container already has a pending receipt');
+    }
+}
