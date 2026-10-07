@@ -77,6 +77,7 @@ export interface CustodyTransfer extends Versioned {
   sealStatus: SealStatus;
   status: 'PENDING_RECEIPT' | 'CONFIRMED' | 'ISOLATED' | 'REJECTED';
   clientOperationId: string;
+  receiptOperationId?: string;
 }
 
 export interface ReceivingRecord extends Versioned {
@@ -199,7 +200,7 @@ export interface SyncEnvelope {
   operationId: string;
   entityId: string;
   baseVersion: number;
-  type: 'CREATE_SAMPLE' | 'CUSTODY_TRANSFER' | 'RECEIVE_CONTAINER' | 'CREATE_ALIQUOT';
+  type: 'CREATE_SAMPLE' | 'CUSTODY_TRANSFER' | 'CONFIRM_RECEIPT' | 'RECEIVE_CONTAINER' | 'CREATE_ALIQUOT';
   payloadHash: string;
   payload: unknown;
   occurredAt: string;

@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "test": "npm run build && node --test test/",
     "smoke": "npm run build && node dist/demo/smoke.js"
   },
   "devDependencies": {
