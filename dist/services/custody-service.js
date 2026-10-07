@@ -1,4 +1,13 @@
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+// Normal custody progression. ISOLATED is a terminal sink handled separately,
+// so an isolation verdict can never be advanced out of by a later receipt.
+const CUSTODY_RANK = {
+    SEALED: 0,
+    HANDED_OVER: 1,
+    RECEIVED: 2,
+    RELEASED_TO_LAB: 3,
+};
+const SEAL_VALUES = ['INTACT', 'BROKEN', 'MISSING', 'RESEALED'];
 export class CustodyService {
     store;
     constructor(store) {
@@ -6,20 +15,24 @@ export class CustodyService {
     }
     handOver(input) {
         this.assertHandoverInput(input);
-        const duplicate = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId);
-        // Mobile retry records can therefore be reused by another tenant.
-        const duplicateFromAnotherTenant = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId && item.tenantId !== input.tenantId);
-        if (duplicateFromAnotherTenant)
-            return duplicateFromAnotherTenant;
-        if (duplicate)
-            return duplicate;
+        // Idempotent replay is scoped to the owning tenant and must carry the same
+        // payload; a retried operation id never resolves to another tenant's record.
+        const replay = [...this.store.transfers.values()].find((item) => item.tenantId === input.tenantId && item.projectId === input.projectId && item.clientOperationId === input.clientOperationId);
+        if (replay) {
+            assertCondition(replay.containerId === input.containerId && replay.fromHolderId === input.fromHolderId && replay.toHolderId === input.toHolderId, 'custody.operation_conflict', 'client operation id was already used with a different handover payload');
+            return replay;
+        }
         const container = assertFound(this.store.containers.get(input.containerId), 'custody.container_not_found', 'container not found');
         this.assertScope(container.tenantId, container.projectId, input.tenantId, input.projectId);
         assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
         assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
-        const prior = [...this.store.transfers.values()]
-            .filter((item) => item.containerId === input.containerId)
-            .sort((a, b) => b.transferSequence - a.transferSequence)[0];
+        const pending = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId && item.status === 'PENDING_RECEIPT');
+        assertCondition(pending.length === 0, 'custody.pending_receipt', 'container already has a pending receipt');
+        const prior = this.latestTransfer(input.containerId);
+        if (prior) {
+            // A backdated handover must not rewrite a newer one to an old location.
+            assertCondition(input.handedOverAt > prior.handedOverAt, 'custody.out_of_order', 'handover time must be later than the previous handover for this container');
+        }
         const transfer = {
             id: this.store.nextId('transfer'),
             tenantId: input.tenantId,
@@ -49,30 +62,99 @@ export class CustodyService {
         return transfer;
     }
     confirmReceipt(transferId, input) {
+        return this.settleReceipt(transferId, input).transfer;
+    }
+    // Each item settles independently: a partial failure never rolls back the
+    // items that confirmed, and every object is reported as confirmed or not.
+    confirmReceiptBatch(items) {
+        return items.map((item) => {
+            const { transferId, ...receipt } = item;
+            try {
+                const { transfer, applied } = this.settleReceipt(transferId, receipt);
+                return {
+                    transferId,
+                    containerId: transfer.containerId,
+                    outcome: applied ? (transfer.status === 'CONFIRMED' ? 'CONFIRMED' : 'ISOLATED') : 'ALREADY_SETTLED',
+                    status: transfer.status,
+                    applied,
+                };
+            }
+            catch (error) {
+                if (error instanceof DomainError) {
+                    const transfer = this.store.transfers.get(transferId);
+                    return {
+                        transferId,
+                        containerId: transfer?.containerId ?? null,
+                        outcome: 'REJECTED',
+                        status: transfer?.status ?? null,
+                        applied: false,
+                        errorCode: error.code,
+                        errorMessage: error.message,
+                    };
+                }
+                throw error;
+            }
+        });
+    }
+    settleReceipt(transferId, input) {
+        this.assertReceiptInput(input);
         const transfer = assertFound(this.store.transfers.get(transferId), 'custody.transfer_not_found', 'transfer not found');
-        const container = assertFound(this.store.containers.get(transfer.containerId), 'custody.container_not_found', 'container not found');
-        if (transfer.status === 'CONFIRMED' || transfer.status === 'ISOLATED')
-            return transfer;
-        assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
-        const latest = [...this.store.transfers.values()]
-            .filter((item) => item.containerId === transfer.containerId)
-            .sort((a, b) => b.transferSequence - a.transferSequence)[0];
-        // pending handover is still overwritten by an old terminal receipt.
-        if (latest && latest.transferSequence > transfer.transferSequence && latest.status === 'CONFIRMED') {
-            return latest;
+        if (transfer.status !== 'PENDING_RECEIPT') {
+            // Terminal transfers are immutable: a duplicated or late receipt can
+            // never flip an isolation back to normal or rewrite the first receipt.
+            this.auditConflictingReplay(transfer, input);
+            return { transfer, applied: false };
         }
+        const container = assertFound(this.store.containers.get(transfer.containerId), 'custody.container_not_found', 'container not found');
+        const latest = this.latestTransfer(transfer.containerId);
+        assertCondition(latest !== undefined && latest.id === transfer.id, 'custody.stale_receipt', 'a newer handover exists for this container; the old receipt cannot move it');
         assertCondition(transfer.toHolderId === input.receiverId, 'custody.receiver_mismatch', 'receiver does not match the transfer');
+        assertCondition(input.receivedAt >= transfer.handedOverAt, 'custody.receipt_before_handover', 'receipt time cannot be earlier than the handover time');
         transfer.receivedAt = input.receivedAt;
-        transfer.sealStatus = input.sealStatus;
+        transfer.receivedBy = input.receiverId;
+        transfer.receiptSealStatus = input.sealStatus;
         transfer.status = input.sealStatus === 'INTACT' ? 'CONFIRMED' : 'ISOLATED';
         transfer.version += 1;
-        container.custodyStatus = transfer.status === 'CONFIRMED' ? 'RECEIVED' : 'ISOLATED';
-        container.sealStatus = input.sealStatus;
+        if (transfer.status === 'ISOLATED') {
+            container.custodyStatus = 'ISOLATED';
+            container.sealStatus = input.sealStatus;
+        }
+        else {
+            this.advanceCustodyStatus(container, 'RECEIVED');
+            this.applySealStatus(container, input.sealStatus);
+        }
         container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
         container.version += 1;
-        this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
+        this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus, receivedBy: input.receiverId } });
         this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
-        return transfer;
+        return { transfer, applied: true };
+    }
+    latestTransfer(containerId) {
+        return [...this.store.transfers.values()]
+            .filter((item) => item.containerId === containerId)
+            .sort((a, b) => b.transferSequence - a.transferSequence)[0];
+    }
+    advanceCustodyStatus(container, next) {
+        const current = container.custodyStatus;
+        if (current === 'ISOLATED')
+            return;
+        if (CUSTODY_RANK[next] > CUSTODY_RANK[current])
+            container.custodyStatus = next;
+    }
+    applySealStatus(container, next) {
+        const abnormalFinding = container.sealStatus === 'BROKEN' || container.sealStatus === 'MISSING';
+        const nextIsNormal = next === 'INTACT' || next === 'RESEALED';
+        // An abnormal seal finding is sticky and cannot be confirmed back to normal.
+        if (abnormalFinding && nextIsNormal)
+            return;
+        container.sealStatus = next;
+    }
+    auditConflictingReplay(transfer, input) {
+        const conflicts = (transfer.receivedBy !== undefined && transfer.receivedBy !== input.receiverId)
+            || (transfer.receiptSealStatus !== undefined && transfer.receiptSealStatus !== input.sealStatus);
+        if (!conflicts)
+            return;
+        this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.receipt_conflict_ignored', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, status: transfer.status, attemptedReceiverId: input.receiverId, attemptedSealStatus: input.sealStatus } });
     }
     assertScope(actualTenant, actualProject, tenantId, projectId) {
         assertCondition(actualTenant === tenantId && actualProject === projectId, 'scope.forbidden', 'object does not belong to the requested project');
@@ -84,10 +166,12 @@ export class CustodyService {
         assertCondition(input.handedOverAt.length > 0, 'custody.invalid_time', 'handover time is required');
         assertCondition(input.clientOperationId.length > 0, 'custody.invalid_operation', 'operation id is required');
         assertCondition(input.toHolderId.length > 0, 'custody.invalid_receiver', 'receiver is required');
-        assertCondition(input.sealStatus === 'INTACT' || input.sealStatus === 'BROKEN' || input.sealStatus === 'MISSING' || input.sealStatus === 'RESEALED', 'custody.invalid_seal', 'unknown seal status');
-        const duplicateSequence = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId && item.handedOverAt === input.handedOverAt);
-        assertCondition(duplicateSequence.length < 2, 'custody.duplicate_timestamp', 'same container cannot have two handovers at the same instant');
-        const pending = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId && item.status === 'PENDING_RECEIPT');
-        assertCondition(pending.length === 0, 'custody.pending_receipt', 'container already has a pending receipt');
+        assertCondition(SEAL_VALUES.includes(input.sealStatus), 'custody.invalid_seal', 'unknown seal status');
+    }
+    assertReceiptInput(input) {
+        assertCondition(input.receiverId.length > 0, 'custody.invalid_receiver', 'receiver is required');
+        assertCondition(input.receivedAt.length > 0, 'custody.invalid_time', 'receipt time is required');
+        assertCondition(Number.isFinite(input.temperatureCelsius), 'custody.invalid_temperature', 'temperature must be finite');
+        assertCondition(SEAL_VALUES.includes(input.sealStatus), 'custody.invalid_seal', 'unknown seal status');
     }
 }

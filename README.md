@@ -7,7 +7,7 @@
 - `src/domain/types.ts`：领域对象、状态和同步模型
 - `src/store/store.ts`：内存 Store、全局 ID、审计、Outbox 和事务快照回滚
 - `src/services/sampling-service.ts`：采样记录与封存容器
-- `src/services/custody-service.ts`：交出、接收、封签和温度轨迹
+- `src/services/custody-service.ts`：交出、接收（含批量确认与部分失败回报）、封签和温度轨迹；交接序号单调唯一，终态回执不可倒退
 - `src/services/receiving-service.ts`：实验室接收、接受/隔离/拒收
 - `src/services/aliquot-service.ts`：批量分装、单位换算、容量扣减和幂等操作
 - `src/services/batch-service.ts`：实验批次成员、协议冻结和运行生命周期

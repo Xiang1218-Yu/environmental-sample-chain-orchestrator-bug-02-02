@@ -73,8 +73,10 @@ export interface CustodyTransfer extends Versioned {
   toLocation: string;
   handedOverAt: string;
   receivedAt?: string;
+  receivedBy?: UserId;
   temperatureCelsius: number;
   sealStatus: SealStatus;
+  receiptSealStatus?: SealStatus;
   status: 'PENDING_RECEIPT' | 'CONFIRMED' | 'ISOLATED' | 'REJECTED';
   clientOperationId: string;
 }

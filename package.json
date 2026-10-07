@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "smoke": "npm run build && node dist/demo/smoke.js"
+    "smoke": "npm run build && node dist/demo/smoke.js",
+    "test": "npm run build && node test/custody-concurrency.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.3"
